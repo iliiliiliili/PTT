@@ -36,6 +36,9 @@ def eval_one_epoch(cfg, model, dataloader, epoch_id, logger, dist_test=False, sa
     succ, prec = evaluator.log_succ_prec()
     progress_bar.close()
 
+    fps = evaluator.total_count / evaluator.total_time
+    print("FPS =", fps)
+
     if tb_log:
         try:
             tb_log.add_scalars('metric', {'succ': succ, 'prec': prec}, epoch_id)
@@ -65,6 +68,9 @@ class TrackingEvaluator:
         self.ret_dict = {}
         self.result_file = output_dir / "track_result.txt"
         self.fp = open(self.result_file, 'w')
+
+        self.total_time = 0
+        self.total_count = 0
 
     def log_succ_prec(self):
         self.Success_run.update(self.evaluator.Success_main.average)
@@ -99,6 +105,8 @@ class TrackingEvaluator:
                             self.ret_dict["results_BBs"].append(box)
                         self.tracker_initialize()
                     else:
+
+                        fps_time = time.time()
                         avg = MovingAverage()
                         self.timer.reset()
                         with self.timer.env('everything else'):
@@ -108,6 +116,10 @@ class TrackingEvaluator:
                             print('Avg fps: %.2f     Avg ms: %.2f         ' % (1 / avg.get_avg(), avg.get_avg() * 1000))
                             if self.cfg.TEST.VISUALIZE:
                                 self.mayavi_show()
+                        
+                        fps_time = time.time() - fps_time
+                        self.total_time += fps_time
+                        self.total_count += 1
 
                     self.evaluator.update_iou(self.ret_dict['this_BB'], self.ret_dict['results_BBs'][-1])
                     tbar.update(1)
