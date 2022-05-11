@@ -11,6 +11,7 @@ from ptt.datasets.kitti.kitti_tracking_utils import PointCloud, get_box_by_offse
 from ptt.datasets.kitti import kitti_tracking_utils as kitti_utils
 from ptt.utils.file_io import save_track_results
 from tools.eval_utils.eval_tracking_metrics import Evaluator, AverageMeter
+from tools.realtime_evaluator import RealTimeEvaluator
 
 
 def eval_one_epoch(cfg, model, dataloader, epoch_id, logger, dist_test=False, save_to_file=False,
@@ -54,6 +55,64 @@ def eval_one_epoch(cfg, model, dataloader, epoch_id, logger, dist_test=False, sa
     return succ, prec
 
 
+def eval_one_epoch_realtime(
+    cfg, model, dataloader, epoch_id, logger, dist_test=False, save_to_file=False,
+    result_dir=None, tb_log=None,
+    data_fps=20,
+    require_predictive_inference=False,
+    wait_for_next_frame=False,
+    cap_model_fps=None,
+    warmups_needed=10,
+):
+    result_dir.mkdir(parents=True, exist_ok=True)
+    final_output_dir = result_dir / 'final_result' / 'data'
+    final_output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info('*************** EPOCH %s EVALUATION *****************' % epoch_id)
+    model.eval()
+
+    progress_bar = tqdm.tqdm(total=dataloader.dataset.num_frames, leave=True, desc='eval', dynamic_ncols=True)
+    start_time = time.time()
+
+    evaluator = TrackingEvaluator(cfg_=cfg, logger_=logger, model_=model, timer_=timer,
+                                  dataset_=dataloader.dataset, output_dir=final_output_dir)
+
+    evaluator.ret_dict.update({'batch_num': 0})
+    for batch_ in dataloader:
+        with torch.no_grad():
+            evaluator.ret_dict['batch_num'] += 1
+            evaluator.test_batch_realtime(
+                batch_, progress_bar,
+                data_fps=data_fps,
+                require_predictive_inference=require_predictive_inference,
+                wait_for_next_frame=wait_for_next_frame,
+                cap_model_fps=cap_model_fps,
+                warmups_needed=warmups_needed,
+            )
+            warmups_needed = 0
+    succ, prec = evaluator.log_succ_prec()
+    progress_bar.close()
+
+    fps = evaluator.total_count / evaluator.total_time
+    print("FPS =", fps)
+    print("total_frames =", evaluator.total_frames)
+    print("dropped_frames =", evaluator.dropped_frames)
+
+    if tb_log:
+        try:
+            tb_log.add_scalars('metric', {'succ': succ, 'prec': prec}, epoch_id)
+        except ValueError:
+            pass
+
+    logger.info('*************** Performance of EPOCH %s *****************' % epoch_id)
+
+    sec_per_example = (time.time() - start_time) / len(dataloader.dataset)
+    logger.info('Generate label finished(sec_per_example: %.4f second).' % sec_per_example)
+
+    logger.info('****************Evaluation done.*****************')
+    return succ, prec
+
+
 class TrackingEvaluator:
     def __init__(self, cfg_, logger_, timer_, model_, dataset_, output_dir):
         self.logger = logger_ if logger_ else print
@@ -71,6 +130,8 @@ class TrackingEvaluator:
 
         self.total_time = 0
         self.total_count = 0
+        self.total_frames = 0
+        self.dropped_frames = 0
 
     def log_succ_prec(self):
         self.Success_run.update(self.evaluator.Success_main.average)
@@ -131,6 +192,93 @@ class TrackingEvaluator:
                     self.save_pts_pcd()
                 self.batch_log()
 
+    def test_batch_realtime(
+        self, batch, tbar,
+        data_fps=20,
+        require_predictive_inference=False,
+        wait_for_next_frame=False,
+        cap_model_fps=None,
+        warmups_needed=10,
+    ):
+
+        real_time_evaluator = RealTimeEvaluator(
+            data_fps=data_fps,
+            require_predictive_inference=require_predictive_inference,
+            wait_for_next_frame=wait_for_next_frame,
+            cap_model_fps=cap_model_fps,
+        )
+
+        for PCs, BBs, list_of_anno in batch:  # tracklet
+            self.ret_dict.update({"results_BBs": []})
+            with self.evaluator:
+
+                allow_extra_last_frame = not require_predictive_inference
+                extra_last_frame_used = False
+
+                i = -1
+                while i < len(PCs):
+                    i += 1
+                    if i >= len(PCs):
+                        if allow_extra_last_frame and not extra_last_frame_used:
+                            i -= 2
+                            extra_last_frame_used = True
+                            continue
+                        else:
+                            break
+
+                    this_anno = list_of_anno[i]
+                    self.ret_dict.update({
+                        "scene_num": this_anno[0], "frame_num": this_anno[1],
+                        "track_id": this_anno[2], "this_BB": BBs[i], "this_PC": PCs[i],
+                        "PCs": PCs, "BBs": BBs
+                    })
+
+                    if i == 0:   # first frame
+                        with self.timer.env('everything else'):
+                            box = self.ret_dict["this_BB"]
+                            # self.ret_dict["results_BBs"].append(box)
+                            real_time_evaluator.init(box, box)
+                            label_BB = box
+                            result_BB = box
+                        self.tracker_initialize()
+                        continue
+                    else:
+
+                        label_BB, result_BB, frame_to_compare, frame_result = real_time_evaluator.on_data(BBs[i], i)
+                        self.ret_dict.update({
+                            "this_BB": label_BB, "this_PC": PCs[i],
+                        })
+                        self.ret_dict["results_BBs"].append(result_BB)
+                        print("frame_to_compare =", frame_to_compare, "frame_result =", frame_result, "frame =", i) 
+
+                        if real_time_evaluator.can_frame_be_processed():
+
+                            avg = MovingAverage()
+                            self.timer.reset()
+
+                            with self.timer.env('everything else'):
+                                self.test_frame_realtime(i, real_time_evaluator)
+                                avg.add(self.timer.total_time())
+                                self.timer.print_stats()
+                                print('Avg fps: %.2f     Avg ms: %.2f         ' % (1 / avg.get_avg(), avg.get_avg() * 1000))
+                                if self.cfg.TEST.VISUALIZE:
+                                    self.mayavi_show()
+                        else:
+                            self.dropped_frames += 1
+                            
+                    self.total_frames += 1
+                    self.evaluator.update_iou(label_BB, result_BB)
+                    tbar.update(1)
+                    tbar.set_description('batch {}  '.format(self.ret_dict["batch_num"]) +
+                                         'batch Succ/Prec:' +
+                                         '{:.1f}/'.format(self.evaluator.Success_batch.average) +
+                                         '{:.1f}'.format(self.evaluator.Precision_batch.average))
+                    # self.save_track_resluts()
+                    # self.save_pts_pcd()
+                print("total_frames =", self.total_frames)
+                print("dropped_frames =", self.dropped_frames)
+                self.batch_log()
+
     def tracker_initialize(self):
         candidate_pc, candidate_label, _ = kitti_utils.crop_center_pc(
             self.ret_dict["this_PC"], self.ret_dict["this_BB"], self.ret_dict["this_BB"],
@@ -162,6 +310,28 @@ class TrackingEvaluator:
         torch.cuda.synchronize()
         with self.timer.env("post process"):
             self.post_process()
+
+    def test_frame_realtime(self, frame, real_time_evaluator):
+        fps_time = time.time()
+
+        torch.cuda.synchronize()
+        with self.timer.env("pre process"):
+            self.prepare_search(frame)
+            self.prepare_template(frame)
+
+        torch.cuda.synchronize()
+        with self.timer.env("model inference"):
+            self.model_inference()
+
+        torch.cuda.synchronize()
+        with self.timer.env("post process"):
+            box = self.post_process_realtime()
+
+        fps_time = time.time() - fps_time
+        self.total_time += fps_time
+        self.total_count += 1
+        
+        real_time_evaluator.on_prediction(box, fps_time, frame)
 
     def prepare_search(self, frame_id, debug=False):
         if "previous_result".upper() in self.cfg.TEST.REF_BOX.upper():
@@ -284,6 +454,16 @@ class TrackingEvaluator:
             'proposal_score': estimation_boxs_cpu[box_idx, 4]
         })
         self.ret_dict["results_BBs"].append(box)
+
+    def post_process_realtime(self):
+        estimation_boxs_cpu = self.ret_dict['model_output']['pred_box'].squeeze(0).detach().cpu().numpy()
+        box_idx = estimation_boxs_cpu[:, 4].argmax()
+        estimation_box_cpu = estimation_boxs_cpu[box_idx, 0:4]
+        box = get_box_by_offset(self.ret_dict['ref_BB'], estimation_box_cpu, self.cfg.DATA_CONFIG.USE_Z_AXIS)
+        self.ret_dict.update({
+            'proposal_score': estimation_boxs_cpu[box_idx, 4]
+        })
+        return box
 
     def save_track_resluts(self):
         box = copy.deepcopy(self.ret_dict["results_BBs"][-1])
